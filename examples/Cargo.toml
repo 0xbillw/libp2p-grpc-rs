@@ -1,0 +1,40 @@
+[package]
+name = "examples"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "req_res"
+path = "bin/req_res/main.rs"
+
+[[bin]]
+name = "nodeinfo-server"
+path = "bin/nodeinfo/server.rs"
+
+[[bin]]
+name = "nodeinfo-client"
+path = "bin/nodeinfo/client.rs"
+
+[dependencies]
+async-trait = "0.1"
+anyhow = { version = "1" }
+tracing = { version = "0.1.16" }
+tracing-subscriber = { version = "0.3", features = ["tracing-log", "fmt"] }
+futures = "0.3"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+prost = "0.11"
+tonic = { version = "0.9.2" }
+libp2p = { version = "0.51", features = [
+    "tokio",
+    "macros",
+    "noise",
+    "tcp",
+    "yamux",
+    "identify",
+    "ping",
+] }
+clap = { version = "4.2", features = ["derive"] }
+libp2p-grpc-rs = { path = "../" }
+
+[build-dependencies]
+tonic-build = { version = "0.9.2", features = ["prost"] }

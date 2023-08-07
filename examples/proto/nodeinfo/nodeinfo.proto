@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package proto.v1;
+
+message NodeInfoRequest {}
+
+message NodeInfoResponse {
+  string id = 1;
+  repeated string addresses = 2;
+  repeated string protocols = 3;
+  repeated string peers = 4;
+}
+
+service NodeService {
+  // Echo asks a node to respond with a message.
+  rpc Info(NodeInfoRequest) returns (NodeInfoResponse) {}
+}
