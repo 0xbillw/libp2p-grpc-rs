@@ -37,8 +37,29 @@ enum Command {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct Config {
+    protocol_name: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            protocol_name: String::from_utf8_lossy(crate::DEFAULT_PROTOCOL_NAME).to_string(),
+        }
+    }
+}
+
+impl Config {
+    pub fn with_protocol_name(mut self, name: &str) -> Self {
+        self.protocol_name = name.to_string();
+        self
+    }
+}
+
 pub struct Behaviour {
     local_peer_id: PeerId,
+    config: Config,
     grpc_service_router: Option<Router>,
     inbound_stream_tx: Option<mpsc::UnboundedSender<io::Result<adapter::NegotiatedStreamWrapper>>>,
     connected: HashMap<PeerId, SmallVec<[Connection; 2]>>,
@@ -51,6 +72,7 @@ impl Behaviour {
     pub fn new(local_peer_id: PeerId, grpc_service_router: Option<Router>) -> Self {
         Self {
             local_peer_id,
+            config: Default::default(),
             grpc_service_router,
             inbound_stream_tx: None,
             connected: HashMap::new(),
@@ -58,6 +80,11 @@ impl Behaviour {
             addresses: HashMap::new(),
             pending_commands: HashMap::new(),
         }
+    }
+
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
     }
 
     fn on_connection_established(
@@ -180,7 +207,11 @@ impl NetworkBehaviour for Behaviour {
         _: &Multiaddr,
         _: &Multiaddr,
     ) -> std::result::Result<THandler<Self>, ConnectionDenied> {
-        Ok(Handler::new(peer_id, connection_id))
+        Ok(Handler::new(
+            peer_id,
+            connection_id,
+            self.config.protocol_name.clone(),
+        ))
     }
 
     fn handle_established_outbound_connection(
@@ -190,7 +221,11 @@ impl NetworkBehaviour for Behaviour {
         _: &Multiaddr,
         _: Endpoint,
     ) -> std::result::Result<THandler<Self>, ConnectionDenied> {
-        Ok(Handler::new(peer_id, connection_id))
+        Ok(Handler::new(
+            peer_id,
+            connection_id,
+            self.config.protocol_name.clone(),
+        ))
     }
 
     fn handle_pending_outbound_connection(
