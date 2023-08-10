@@ -1,4 +1,4 @@
-use crate::{adapter, PROTOCOL_NAME};
+use crate::adapter;
 use futures::FutureExt;
 use libp2p::{
     core::upgrade::ReadyUpgrade,
@@ -30,15 +30,17 @@ pub enum Error {
 pub struct Handler {
     remote_peer_id: PeerId,
     connection_id: ConnectionId,
+    protocol_name: String,
     inbound_streams: VecDeque<NegotiatedSubstream>,
     outbound: Option<OutboundState>,
 }
 
 impl Handler {
-    pub fn new(remote_peer_id: PeerId, connection_id: ConnectionId) -> Self {
+    pub fn new(remote_peer_id: PeerId, connection_id: ConnectionId, protocol_name: String) -> Self {
         Handler {
             remote_peer_id,
             connection_id,
+            protocol_name,
             inbound_streams: VecDeque::new(),
             outbound: None,
         }
@@ -60,13 +62,13 @@ impl ConnectionHandler for Handler {
     type InEvent = InEvent;
     type OutEvent = Event;
     type Error = Error;
-    type InboundProtocol = ReadyUpgrade<&'static [u8]>;
-    type OutboundProtocol = ReadyUpgrade<&'static [u8]>;
+    type InboundProtocol = ReadyUpgrade<String>;
+    type OutboundProtocol = ReadyUpgrade<String>;
     type OutboundOpenInfo = ();
     type InboundOpenInfo = ();
 
-    fn listen_protocol(&self) -> SubstreamProtocol<ReadyUpgrade<&'static [u8]>, ()> {
-        SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL_NAME), ())
+    fn listen_protocol(&self) -> SubstreamProtocol<ReadyUpgrade<String>, ()> {
+        SubstreamProtocol::new(ReadyUpgrade::new(self.protocol_name.clone()), ())
     }
 
     fn on_behaviour_event(&mut self, _: Self::InEvent) {}
@@ -108,7 +110,8 @@ impl ConnectionHandler for Handler {
             }
             None => {
                 self.outbound = Some(OutboundState::OpenStream);
-                let protocol = SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL_NAME), ());
+                let protocol =
+                    SubstreamProtocol::new(ReadyUpgrade::new(self.protocol_name.clone()), ());
                 return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest { protocol });
             }
         }
