@@ -82,6 +82,11 @@ impl Behaviour {
         }
     }
 
+    pub fn with_protocol_name(mut self, name: &str) -> Self {
+        self.config.protocol_name = name.to_string();
+        self
+    }
+
     pub fn with_config(mut self, config: Config) -> Self {
         self.config = config;
         self
