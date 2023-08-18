@@ -3,11 +3,11 @@ use examples::nodeinfo::{self};
 use futures::prelude::*;
 use libp2p::core::upgrade::Version;
 use libp2p::{
-    identify, identity, noise, ping,
-    swarm::{NetworkBehaviour, SwarmBuilder, SwarmEvent},
+    identity, noise,
+    swarm::{SwarmBuilder, SwarmEvent},
     tcp, yamux, PeerId, Transport,
 };
-use libp2p_grpc_rs::{Behaviour as GrpcBehaviour, Event as GrpcEvent};
+use libp2p_grpc_rs::Behaviour as GrpcBehaviour;
 use tonic::transport::Server;
 
 #[derive(Parser, Debug, Clone)]
@@ -44,14 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut swarm = SwarmBuilder::with_tokio_executor(
         transport,
-        ComposedBehaviour {
-            grpc: GrpcBehaviour::new(local_peer_id.clone(), Some(router)),
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/ipfs/id/1.0.0".to_string(),
-                local_key.public(),
-            )),
-            ping: ping::Behaviour::new(Default::default()),
-        },
+        GrpcBehaviour::new(local_peer_id.clone(), Some(router)),
         local_peer_id,
     )
     .build();
@@ -66,38 +59,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::debug!(swarm_event = ?evt, "other swarm event");
             }
         }
-    }
-}
-
-#[derive(NetworkBehaviour)]
-#[behaviour(out_event = "ComposedEvent")]
-struct ComposedBehaviour {
-    grpc: GrpcBehaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-}
-
-#[derive(Debug)]
-enum ComposedEvent {
-    Grpc(GrpcEvent),
-    Identify(identify::Event),
-    Ping(ping::Event),
-}
-
-impl From<GrpcEvent> for ComposedEvent {
-    fn from(event: GrpcEvent) -> Self {
-        ComposedEvent::Grpc(event)
-    }
-}
-
-impl From<identify::Event> for ComposedEvent {
-    fn from(event: identify::Event) -> Self {
-        ComposedEvent::Identify(event)
-    }
-}
-
-impl From<ping::Event> for ComposedEvent {
-    fn from(event: ping::Event) -> Self {
-        ComposedEvent::Ping(event)
     }
 }

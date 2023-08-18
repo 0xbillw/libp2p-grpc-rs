@@ -1,16 +1,16 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use examples::nodeinfo::pb::{node_service_client::NodeServiceClient, NodeInfoRequest};
-use futures::{channel::mpsc, prelude::*};
+use futures::{channel::mpsc, future::BoxFuture, prelude::*, stream::FuturesUnordered};
 use libp2p::{
     core::upgrade::Version,
     identity,
     multiaddr::Protocol,
-    noise, ping,
-    swarm::{NetworkBehaviour, SwarmBuilder},
+    noise,
+    swarm::SwarmBuilder,
     tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
 };
-use libp2p_grpc_rs::{Behaviour as GrpcBehaviour, Event as GrpcEvent};
+use libp2p_grpc_rs::Behaviour as GrpcBehaviour;
 use tonic::Request;
 
 #[derive(Parser, Debug, Clone)]
@@ -22,31 +22,6 @@ pub struct Args {
     pub key_seed: Option<u8>,
     #[clap(long, short)]
     pub remote: Multiaddr,
-}
-
-#[derive(NetworkBehaviour)]
-#[behaviour(out_event = "ComposedEvent")]
-struct ComposedBehaviour {
-    ping: ping::Behaviour,
-    grpc: GrpcBehaviour,
-}
-
-#[derive(Debug)]
-enum ComposedEvent {
-    Ping(ping::Event),
-    Grpc(GrpcEvent),
-}
-
-impl From<GrpcEvent> for ComposedEvent {
-    fn from(event: GrpcEvent) -> Self {
-        ComposedEvent::Grpc(event)
-    }
-}
-
-impl From<ping::Event> for ComposedEvent {
-    fn from(event: ping::Event) -> Self {
-        ComposedEvent::Ping(event)
-    }
 }
 
 #[tokio::main]
@@ -78,23 +53,22 @@ async fn main() -> Result<()> {
 
     let swarm = SwarmBuilder::with_tokio_executor(
         transport,
-        ComposedBehaviour {
-            ping: ping::Behaviour::new(Default::default()),
-            grpc: GrpcBehaviour::new(local_peer_id.clone(), None),
-        },
+        GrpcBehaviour::new(local_peer_id.clone(), None),
         local_peer_id,
     )
     .build();
 
-    let (mut command_tx, command_rx) = mpsc::channel(3);
-    let el = EventLoop { swarm, command_rx };
+    let (el, mut command_tx) = EventLoop::new(swarm);
     let jh = tokio::spawn(el.run());
-    let _ = command_tx
-        .send(Command::GetRemoteInfo {
-            peer_id: remote_peer_id,
-            address: args.remote,
-        })
-        .await;
+    for i in 0..2 {
+        tracing::debug!("--> round {}", i);
+        let _ = command_tx
+            .send(Command::GetRemoteInfo {
+                peer_id: remote_peer_id,
+                address: args.remote.clone(),
+            })
+            .await;
+    }
     let _ = jh.await;
     Ok(())
 }
@@ -105,50 +79,65 @@ enum Command {
 }
 
 struct EventLoop {
-    swarm: Swarm<ComposedBehaviour>,
+    swarm: Swarm<GrpcBehaviour>,
     command_rx: mpsc::Receiver<Command>,
+    command_exec_futs: FuturesUnordered<BoxFuture<'static, ()>>,
 }
 
 impl EventLoop {
+    pub fn new(swarm: Swarm<GrpcBehaviour>) -> (Self, mpsc::Sender<Command>) {
+        let (command_tx, command_rx) = mpsc::channel(3);
+        let el = EventLoop {
+            swarm,
+            command_rx,
+            command_exec_futs: FuturesUnordered::new(),
+        };
+        (el, command_tx)
+    }
+
     pub async fn run(mut self) {
         loop {
             futures::select! {
-                evt = self.swarm.select_next_some() => {
-                    tracing::debug!(event=?evt, "swarm event")
+                evt = self.swarm.select_next_some() => {                    
+                    tracing::debug!(swarm_event=?evt, "catch SwarmEvent")
                 },
-                command = self.command_rx.next() => match command {
-                    Some(c) => self.handle_command(c).await,
-                    None =>  break,
+                opt = self.command_rx.next() => match opt {
+                    Some(cmd) => self.handle_command(cmd),
+                    None => break,
                 },
+                _ = self.command_exec_futs.next() => {}
             }
         }
         tracing::debug!("event loop exit");
     }
 
-    async fn handle_command(&mut self, cmd: Command) {
-        tracing::debug!(cmd = ?cmd);
+    fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::GetRemoteInfo { peer_id, address } => {
                 tracing::debug!("begin create channel, address: {:?}", address);
                 self.swarm
                     .behaviour_mut()
-                    .grpc
                     .add_address(&peer_id, address.clone());
-                let _ = self.swarm.dial(address);
-                // FIXME: the client can't outbound stream,
-                // the log block on:
-                // multistream_select::dialer_select: Dialer: Expecting proposed protocol: /yamux/1.0.0
-                // yamux::connection: new connection: aabe2b2b (Client)
-                let ch = self
-                    .swarm
-                    .behaviour_mut()
-                    .grpc
-                    .grpc_client_channel(peer_id)
-                    .await
-                    .unwrap();
-                let mut client = NodeServiceClient::new(ch);
-                let resp = client.info(Request::new(NodeInfoRequest {})).await.unwrap();
-                tracing::debug!(response=?resp, "got response");
+
+                let result = self.swarm.behaviour_mut().initiate_grpc_outbound(&peer_id);
+                let fut = async move {
+                    let (ch, outbound_id) = match result.map().await {
+                        Ok((ch, outbound_id)) => (ch, outbound_id),
+                        Err(e) => {
+                            tracing::error!("gRPC outbound error: {:?}", e);
+                            return
+                        }                        
+                    };
+                    let mut client = NodeServiceClient::new(ch);
+                        for i in 0..3 {
+                            let resp = client.info(Request::new(NodeInfoRequest {})).await.unwrap();
+                            tracing::debug!(index=%i, response=?resp, outbound_id=%outbound_id, "got response");
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    
+                }.boxed();
+                self.command_exec_futs.push(fut);
+
             }
         }
     }
