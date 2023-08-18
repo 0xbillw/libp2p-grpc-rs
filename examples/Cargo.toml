@@ -16,7 +16,6 @@ name = "nodeinfo-client"
 path = "bin/nodeinfo/client.rs"
 
 [dependencies]
-async-trait = "0.1"
 anyhow = { version = "1" }
 tracing = { version = "0.1.16" }
 tracing-subscriber = { version = "0.3", features = ["tracing-log", "fmt"] }
@@ -30,8 +29,6 @@ libp2p = { version = "0.51", features = [
     "noise",
     "tcp",
     "yamux",
-    "identify",
-    "ping",
 ] }
 clap = { version = "4.2", features = ["derive"] }
 libp2p-grpc-rs = { path = "../" }

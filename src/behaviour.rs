@@ -1,6 +1,11 @@
 use crate::{
     adapter,
-    handler::{self, Event as HandlerEvent, Handler},
+    handler::{Event as HandlerEvent, Handler},
+    protocol::DEFAULT_PROTOCOL_NAME,
+    InboundId, InboundIdGen, OutboundId, OutboundRequest,
+};
+use futures::{
+    channel::oneshot, future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt,
 };
 use libp2p::{
     core::{ConnectedPoint, Endpoint, Multiaddr},
@@ -10,8 +15,8 @@ use libp2p::{
         behaviour::{ConnectionClosed, ConnectionEstablished, FromSwarm, NewListener},
         derive_prelude::ListenerId,
         dial_opts::DialOpts,
-        ConnectionDenied, ConnectionId, NetworkBehaviour, PollParameters, THandler,
-        THandlerInEvent, THandlerOutEvent, ToSwarm,
+        ConnectionDenied, ConnectionId, DialFailure, NetworkBehaviour, NotifyHandler,
+        PollParameters, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
     },
 };
 use smallvec::SmallVec;
@@ -20,21 +25,66 @@ use std::{
     io,
     task::{Context, Poll},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tonic::transport::server::Router;
 
 #[derive(Debug)]
 pub enum Event {
+    InboundSuccess {
+        peer: PeerId,
+        inbound_id: InboundId,
+    },
+
+    InboundFailure {
+        peer: PeerId,
+        inbound_id: InboundId,
+        error: InboundError,
+    },
+
     OutboundSuccess {
         peer: PeerId,
-        connection_id: ConnectionId,
+        outbound_id: OutboundId,
+        channel: adapter::Channel,
+    },
+
+    OutboundFailure {
+        peer: PeerId,
+        outbound_id: OutboundId,
+        error: OutboundError,
+    },
+
+    LiteralOutboundFailure {
+        peer: PeerId,
+        outbound_id: OutboundId,
+        error: String,
     },
 }
 
-enum Command {
-    Outbound {
-        sender: oneshot::Sender<adapter::TonicChannelResult>,
-    },
+#[derive(Debug, thiserror::Error)]
+pub enum InboundError {
+    #[error("reading the inbound request timed out")]
+    Timeout,
+
+    #[error("the connection closed before a response could be send")]
+    ConnectionClosed,
+
+    #[error("the local peer supports none of the protocol requested by the remote")]
+    UnsupportedProtocol,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OutboundError {
+    #[error("Failed to dial the requested peer")]
+    DialFailure,
+
+    #[error("the request timed out before a response was received")]
+    Timeout,
+
+    #[error(transparent)]
+    GrpcChannel(#[from] adapter::TonicTransportError),
+
+    #[error("the remote supports none of the requested protocol")]
+    UnsupportedProtocol,
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +95,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            protocol_name: String::from_utf8_lossy(crate::DEFAULT_PROTOCOL_NAME).to_string(),
+            protocol_name: String::from_utf8_lossy(DEFAULT_PROTOCOL_NAME).to_string(),
         }
     }
 }
@@ -60,12 +110,19 @@ impl Config {
 pub struct Behaviour {
     local_peer_id: PeerId,
     config: Config,
+    connected: HashMap<PeerId, SmallVec<[Connection; 2]>>,
+    pending_events: VecDeque<ToSwarm<Event, OutboundRequest>>,
+
     grpc_service_router: Option<Router>,
     inbound_stream_tx: Option<mpsc::UnboundedSender<io::Result<adapter::NegotiatedStreamWrapper>>>,
-    connected: HashMap<PeerId, SmallVec<[Connection; 2]>>,
-    pending_events: VecDeque<ToSwarm<Event, handler::InEvent>>,
+
+    inbound_id_gen: InboundIdGen,
+    next_outbound_id: OutboundId,
     addresses: HashMap<PeerId, SmallVec<[Multiaddr; 6]>>,
-    pending_commands: HashMap<PeerId, Command>,
+    pending_outbounds: HashMap<PeerId, OutboundRequest>,
+    pending_grpc_channel_futs: FuturesUnordered<
+        BoxFuture<'static, (adapter::OutboundGrpcChannelResult, OutboundRequest, PeerId)>,
+    >,
 }
 
 impl Behaviour {
@@ -73,12 +130,15 @@ impl Behaviour {
         Self {
             local_peer_id,
             config: Default::default(),
+            connected: HashMap::new(),
             grpc_service_router,
             inbound_stream_tx: None,
-            connected: HashMap::new(),
             pending_events: VecDeque::new(),
             addresses: HashMap::new(),
-            pending_commands: HashMap::new(),
+            pending_outbounds: HashMap::new(),
+            inbound_id_gen: InboundIdGen::new(1),
+            next_outbound_id: OutboundId::new(1),
+            pending_grpc_channel_futs: FuturesUnordered::new(),
         }
     }
 
@@ -98,6 +158,7 @@ impl Behaviour {
             peer_id,
             connection_id,
             endpoint,
+            other_established,
             ..
         }: ConnectionEstablished,
     ) {
@@ -105,10 +166,33 @@ impl Behaviour {
             ConnectedPoint::Dialer { address, .. } => Some(address.clone()),
             ConnectedPoint::Listener { .. } => None,
         };
+
         self.connected
             .entry(peer_id)
             .or_default()
             .push(Connection::new(connection_id, address));
+
+        if other_established == 0 {
+            if let Some(req) = self.pending_outbounds.remove(&peer_id) {
+                if let Some(connections) = self.connected.get_mut(&peer_id) {
+                    let conn = connections
+                        .iter_mut()
+                        .filter(|conn| conn.id == connection_id)
+                        .nth(0)
+                        .expect("the connection set must contain the connection_id that was just inserted");
+                    conn.serving_channel = Some((req.outbound_id, None));
+                    self.pending_events.push_back(ToSwarm::NotifyHandler {
+                        peer_id,
+                        handler: NotifyHandler::One(conn.id),
+                        event: req,
+                    });
+                } else {
+                    unreachable!(
+                        "The connected HashMap must contain the Peer that was just inserted"
+                    );
+                }
+            }
+        }
     }
 
     fn on_connection_closed(
@@ -152,18 +236,48 @@ impl Behaviour {
         self.grpc_service_router = Some(grpc_service_router);
     }
 
-    pub async fn grpc_client_channel(
-        &mut self,
-        target_peer_id: PeerId,
-    ) -> adapter::TonicChannelResult {
-        let (tx, rx) = oneshot::channel();
+    pub fn initiate_grpc_outbound(&mut self, target_peer_id: &PeerId) -> GrpcOutbound {
+        if let Some(conns) = self.connected.get(target_peer_id) {
+            for conn in conns {
+                if let Some((outbound_id, Some(channel))) = &conn.serving_channel {
+                    return GrpcOutbound::ServingChannel {
+                        channel: channel.clone(),
+                        outbound_id: *outbound_id,
+                    };
+                }
+            }
+        }
+
+        if let Some(req) = self.pending_outbounds.get(target_peer_id) {
+            return GrpcOutbound::PendingOutbound {
+                outbound_id: req.outbound_id,
+            };
+        }
+
+        let (chr_tx, chr_rx) = oneshot::channel();
         self.pending_events.push_back(ToSwarm::Dial {
-            opts: DialOpts::peer_id(target_peer_id.clone()).build(),
+            opts: DialOpts::peer_id(*target_peer_id).build(),
         });
-        self.pending_commands
-            .insert(target_peer_id, Command::Outbound { sender: tx });
-        let r = rx.await.unwrap();
-        return r;
+        let outbound_id = self.next_outbound_id();
+        self.pending_outbounds.insert(
+            *target_peer_id,
+            OutboundRequest {
+                peer: *target_peer_id,
+                outbound_id,
+                sender: chr_tx,
+            },
+        );
+
+        GrpcOutbound::WaitingChannel {
+            outbound_id,
+            channel_rx: chr_rx,
+        }
+    }
+
+    fn next_outbound_id(&mut self) -> OutboundId {
+        let outbound_id = self.next_outbound_id;
+        self.next_outbound_id += 1;
+        outbound_id
     }
 
     pub fn local_peer_id(&self) -> &PeerId {
@@ -199,6 +313,50 @@ impl Behaviour {
             false
         }
     }
+
+    fn on_dial_failure(&mut self, DialFailure { peer_id, .. }: DialFailure) {
+        if let Some(peer) = peer_id {
+            if let Some(req) = self.pending_outbounds.remove(&peer) {
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                        peer,
+                        outbound_id: req.outbound_id,
+                        error: OutboundError::DialFailure,
+                    }));
+                let _ = req.sender.send(Err(OutboundError::DialFailure));
+            }
+        }
+    }
+
+    fn remove_pending_outbound(
+        &mut self,
+        peer_id: &PeerId,
+        connection_id: ConnectionId,
+        outbount_id: &OutboundId,
+    ) -> bool {
+        self.get_connection_mut(peer_id, connection_id)
+            .map(|c| {
+                if let Some((id, ch_opt)) = &c.serving_channel {
+                    debug_assert!(ch_opt.is_none(), "Expect the none serving channel");
+                    if *outbount_id == *id {
+                        c.serving_channel = None;
+                        return true;
+                    }
+                }
+                return false;
+            })
+            .unwrap_or(false)
+    }
+
+    fn get_connection_mut(
+        &mut self,
+        peer_id: &PeerId,
+        connection_id: ConnectionId,
+    ) -> Option<&mut Connection> {
+        self.connected
+            .get_mut(peer_id)
+            .and_then(|connections| connections.iter_mut().find(|c| c.id == connection_id))
+    }
 }
 
 impl NetworkBehaviour for Behaviour {
@@ -207,29 +365,27 @@ impl NetworkBehaviour for Behaviour {
 
     fn handle_established_inbound_connection(
         &mut self,
-        connection_id: ConnectionId,
-        peer_id: PeerId,
+        _: ConnectionId,
+        _: PeerId,
         _: &Multiaddr,
         _: &Multiaddr,
     ) -> std::result::Result<THandler<Self>, ConnectionDenied> {
         Ok(Handler::new(
-            peer_id,
-            connection_id,
             self.config.protocol_name.clone(),
+            self.inbound_id_gen.clone(),
         ))
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        connection_id: ConnectionId,
-        peer_id: PeerId,
+        _: ConnectionId,
+        _: PeerId,
         _: &Multiaddr,
         _: Endpoint,
     ) -> std::result::Result<THandler<Self>, ConnectionDenied> {
         Ok(Handler::new(
-            peer_id,
-            connection_id,
             self.config.protocol_name.clone(),
+            self.inbound_id_gen.clone(),
         ))
     }
 
@@ -247,7 +403,7 @@ impl NetworkBehaviour for Behaviour {
 
         let mut addresses = Vec::new();
         if let Some(connections) = self.connected.get(&peer) {
-            addresses.extend(connections.iter().filter_map(|c| c.address.clone()))
+            addresses.extend(connections.iter().filter_map(|c| c.target_address.clone()))
         }
         if let Some(more) = self.addresses.get(&peer) {
             addresses.extend(more.into_iter().cloned());
@@ -262,8 +418,7 @@ impl NetworkBehaviour for Behaviour {
         event: THandlerOutEvent<Self>,
     ) {
         match event {
-            HandlerEvent::InboundStream(stream) => {
-                tracing::debug!(inbound_stream = ?stream);
+            HandlerEvent::InboundStream { inbound_id, stream } => {
                 if let Some(sender) = &mut self.inbound_stream_tx {
                     if let Err(e) = sender.send(Ok(adapter::NegotiatedStreamWrapper::new(
                         stream,
@@ -272,32 +427,122 @@ impl NetworkBehaviour for Behaviour {
                     ))) {
                         tracing::error!(error = ?e, "inbound stream send error");
                     }
+                    tracing::debug!(remote_peer=?peer, ?connection_id, ?inbound_id, "got gRPC inbound stream");
+                    self.pending_events
+                        .push_back(ToSwarm::GenerateEvent(Event::InboundSuccess {
+                            peer,
+                            inbound_id,
+                        }));
                 }
             }
-            HandlerEvent::OutboundGrpcChannel(result) => {
-                if let Some(cmd) = self.pending_commands.remove(&peer) {
-                    match cmd {
-                        Command::Outbound {
-                            sender: channel_sender,
-                            ..
-                        } => {
-                            let _ = channel_sender.send(result);
-                        }
-                    }
+
+            HandlerEvent::OutboundStream {
+                outbound_request,
+                stream,
+            } => {
+                let stream_wrapper =
+                    adapter::NegotiatedStreamWrapper::new(stream, peer, connection_id);
+                let fut = async move {
+                    let chr = adapter::make_outbound_stream_to_grpc_channel(stream_wrapper).await;
+                    (chr, outbound_request, peer)
                 }
+                .boxed();
+                self.pending_grpc_channel_futs.push(fut);
+            }
+
+            HandlerEvent::InboundTimeout(inbound_id) => {
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
+                        peer,
+                        inbound_id,
+                        error: InboundError::Timeout,
+                    }));
+            }
+
+            HandlerEvent::InboundUnsupportedProtocols(inbound_id) => {
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
+                        peer,
+                        inbound_id,
+                        error: InboundError::UnsupportedProtocol,
+                    }));
+            }
+
+            HandlerEvent::OutboundTimeout(req) => {
+                let removed = self.remove_pending_outbound(&peer, connection_id, &req.outbound_id);
+                debug_assert!(
+                    removed,
+                    "Expect outbound_id to be pending before request times out."
+                );
+
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                        peer,
+                        outbound_id: req.outbound_id,
+                        error: OutboundError::Timeout,
+                    }));
+            }
+
+            HandlerEvent::OutboundUnsupportedProtocols(req) => {
+                let removed = self.remove_pending_outbound(&peer, connection_id, &req.outbound_id);
+                debug_assert!(
+                    removed,
+                    "Expect outbound_id to be pending before failing to connect.",
+                );
+
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                        peer,
+                        outbound_id: req.outbound_id,
+                        error: OutboundError::UnsupportedProtocol,
+                    }));
             }
         }
     }
 
     fn poll(
         &mut self,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         _: &mut impl PollParameters,
     ) -> Poll<ToSwarm<Self::OutEvent, THandlerInEvent<Self>>> {
         if let Some(evt) = self.pending_events.pop_front() {
             return Poll::Ready(evt);
         } else if self.pending_events.capacity() > crate::EMPTY_QUEUE_SHRINK_THRESHOLD {
             self.pending_events.shrink_to_fit();
+        }
+
+        match self.pending_grpc_channel_futs.poll_next_unpin(cx) {
+            Poll::Ready(Some((chr, req, peer))) => match chr {
+                Ok(channel) => {
+                    tracing::debug!("gRPC channel ready for {} {}", req.peer, req.outbound_id);
+                    if let Some(conns) = self.connected.get_mut(&peer) {
+                        for conn in conns {
+                            if let Some((outbound_id, _)) = &conn.serving_channel {
+                                if req.outbound_id == *outbound_id {
+                                    conn.serving_channel =
+                                        Some((*outbound_id, Some(channel.clone())));
+                                }
+                            }
+                        }
+                    }
+                    let _ = req.sender.send(Ok(channel.clone()));
+                    return Poll::Ready(ToSwarm::GenerateEvent(Event::OutboundSuccess {
+                        peer: req.peer,
+                        outbound_id: req.outbound_id,
+                        channel,
+                    }));
+                }
+                Err(error) => {
+                    let err_str = error.to_string();
+                    let _ = req.sender.send(Err(OutboundError::GrpcChannel(error)));
+                    return Poll::Ready(ToSwarm::GenerateEvent(Event::LiteralOutboundFailure {
+                        peer: req.peer,
+                        outbound_id: req.outbound_id,
+                        error: err_str,
+                    }));
+                }
+            },
+            Poll::Ready(None) | Poll::Pending => {}
         }
 
         Poll::Pending
@@ -314,9 +559,9 @@ impl NetworkBehaviour for Behaviour {
             FromSwarm::NewListener(NewListener { listener_id }) => {
                 self.on_new_listener(listener_id)
             }
+            FromSwarm::DialFailure(dial_failure) => self.on_dial_failure(dial_failure),
             FromSwarm::NewListenAddr(_)
             | FromSwarm::ListenFailure(_)
-            | FromSwarm::DialFailure(_)
             | FromSwarm::AddressChange(_)
             | FromSwarm::ExpiredListenAddr(_)
             | FromSwarm::ListenerError(_)
@@ -329,11 +574,70 @@ impl NetworkBehaviour for Behaviour {
 
 struct Connection {
     id: ConnectionId,
-    address: Option<Multiaddr>,
+    target_address: Option<Multiaddr>,
+    serving_channel: Option<(OutboundId, Option<adapter::Channel>)>,
 }
 
 impl Connection {
     fn new(id: ConnectionId, address: Option<Multiaddr>) -> Self {
-        Self { id, address }
+        Self {
+            id,
+            target_address: address,
+            serving_channel: None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GrpcOutboundMapError {
+    #[error("the prev gRPC outbound request is pending")]
+    PrevOutbondPending(OutboundId),
+
+    #[error(transparent)]
+    OutboundError(#[from] OutboundError),
+
+    #[error(transparent)]
+    SenderCanceled(#[from] oneshot::Canceled),
+}
+
+pub enum GrpcOutbound {
+    ServingChannel {
+        outbound_id: OutboundId,
+        channel: adapter::Channel,
+    },
+
+    WaitingChannel {
+        outbound_id: OutboundId,
+        channel_rx: oneshot::Receiver<Result<adapter::Channel, OutboundError>>,
+    },
+
+    PendingOutbound {
+        outbound_id: OutboundId,
+    },
+}
+
+impl GrpcOutbound {
+    pub async fn map(self) -> Result<(adapter::Channel, OutboundId), GrpcOutboundMapError> {
+        match self {
+            Self::ServingChannel {
+                channel,
+                outbound_id,
+            } => Ok((channel, outbound_id)),
+
+            Self::WaitingChannel {
+                channel_rx,
+                outbound_id,
+            } => match channel_rx.await {
+                Ok(chr) => match chr {
+                    Ok(ch) => Ok((ch, outbound_id)),
+                    Err(e) => Err(GrpcOutboundMapError::OutboundError(e)),
+                },
+                Err(e) => Err(GrpcOutboundMapError::SenderCanceled(e)),
+            },
+
+            Self::PendingOutbound { outbound_id } => {
+                Err(GrpcOutboundMapError::PrevOutbondPending(outbound_id))
+            }
+        }
     }
 }

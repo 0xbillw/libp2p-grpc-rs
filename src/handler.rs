@@ -1,77 +1,140 @@
-use crate::adapter;
-use futures::FutureExt;
+use crate::{protocol::DirectGrpcUpgradeProtocol, InboundId, InboundIdGen, OutboundRequest};
 use libp2p::{
-    core::upgrade::ReadyUpgrade,
+    core::upgrade::{NegotiationError, UpgradeError},
     swarm::{
         handler::{
-            ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
+            ConnectionEvent, ConnectionHandlerUpgrErr, DialUpgradeError, FullyNegotiatedInbound,
+            FullyNegotiatedOutbound, ListenUpgradeError,
         },
-        ConnectionHandler, ConnectionHandlerEvent, ConnectionId, KeepAlive, NegotiatedSubstream,
+        ConnectionHandler, ConnectionHandlerEvent, KeepAlive, NegotiatedSubstream,
         SubstreamProtocol,
     },
-    PeerId,
 };
-
-use std::collections::VecDeque;
-use std::task::{Context, Poll};
+use std::{
+    collections::VecDeque,
+    fmt::Debug,
+    io,
+    task::{Context, Poll},
+};
 
 #[derive(Debug)]
 pub enum Event {
-    InboundStream(NegotiatedSubstream),
-    OutboundGrpcChannel(adapter::TonicChannelResult),
-}
+    InboundStream {
+        inbound_id: InboundId,
+        stream: NegotiatedSubstream,
+    },
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("time out")]
-    Timeout,
+    OutboundStream {
+        outbound_request: OutboundRequest,
+        stream: NegotiatedSubstream,
+    },
+
+    OutboundTimeout(OutboundRequest),
+
+    OutboundUnsupportedProtocols(OutboundRequest),
+
+    InboundTimeout(InboundId),
+
+    InboundUnsupportedProtocols(InboundId),
 }
 
 pub struct Handler {
-    remote_peer_id: PeerId,
-    connection_id: ConnectionId,
     protocol_name: String,
-    inbound_streams: VecDeque<NegotiatedSubstream>,
-    outbound: Option<OutboundState>,
+    outbounds: VecDeque<OutboundRequest>,
+    pending_error: Option<ConnectionHandlerUpgrErr<io::Error>>,
+    pending_events: VecDeque<Event>,
+    inbound_id_gen: InboundIdGen,
 }
 
 impl Handler {
-    pub fn new(remote_peer_id: PeerId, connection_id: ConnectionId, protocol_name: String) -> Self {
+    pub fn new(protocol_name: String, inbound_id_gen: InboundIdGen) -> Self {
         Handler {
-            remote_peer_id,
-            connection_id,
             protocol_name,
-            inbound_streams: VecDeque::new(),
-            outbound: None,
+            inbound_id_gen,
+            outbounds: VecDeque::new(),
+            pending_error: None,
+            pending_events: VecDeque::new(),
         }
     }
 
     fn on_dial_upgrade_error(
         &mut self,
-        DialUpgradeError { .. }: DialUpgradeError<
+        DialUpgradeError { info, error }: DialUpgradeError<
             <Self as ConnectionHandler>::OutboundOpenInfo,
             <Self as ConnectionHandler>::OutboundProtocol,
         >,
     ) {
+        match error {
+            ConnectionHandlerUpgrErr::Timeout => {
+                self.pending_events.push_back(Event::OutboundTimeout(info));
+            }
+            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(NegotiationError::Failed)) => {
+                // The remote merely doesn't support the protocol(s) we requested.
+                // This is no reason to close the connection, which may
+                // successfully communicate with other protocols already.
+                // An event is reported to permit user code to react to the fact that
+                // the remote peer does not support the requested protocol(s).
+                self.pending_events
+                    .push_back(Event::OutboundUnsupportedProtocols(info));
+            }
+            _ => {
+                // Anything else is considered a fatal error or misbehaviour of
+                // the remote peer and results in closing the connection.
+                self.pending_error = Some(error);
+            }
+        }
+    }
+
+    fn on_listen_upgrade_error(
+        &mut self,
+        ListenUpgradeError { info, error }: ListenUpgradeError<
+            <Self as ConnectionHandler>::InboundOpenInfo,
+            <Self as ConnectionHandler>::InboundProtocol,
+        >,
+    ) {
+        match error {
+            ConnectionHandlerUpgrErr::Timeout => {
+                self.pending_events.push_back(Event::InboundTimeout(info))
+            }
+            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(NegotiationError::Failed)) => {
+                // The local peer merely doesn't support the protocol(s) requested.
+                // This is no reason to close the connection, which may
+                // successfully communicate with other protocols already.
+                // An event is reported to permit user code to react to the fact that
+                // the local peer does not support the requested protocol(s).
+                self.pending_events
+                    .push_back(Event::InboundUnsupportedProtocols(info));
+            }
+            _ => {
+                // Anything else is considered a fatal error or misbehaviour of
+                // the remote peer and results in closing the connection.
+                self.pending_error = Some(error);
+            }
+        }
     }
 }
 
-pub type InEvent = void::Void;
-
 impl ConnectionHandler for Handler {
-    type InEvent = InEvent;
+    type InEvent = OutboundRequest;
     type OutEvent = Event;
-    type Error = Error;
-    type InboundProtocol = ReadyUpgrade<String>;
-    type OutboundProtocol = ReadyUpgrade<String>;
-    type OutboundOpenInfo = ();
-    type InboundOpenInfo = ();
+    type Error = ConnectionHandlerUpgrErr<io::Error>;
+    type InboundProtocol = DirectGrpcUpgradeProtocol;
+    type InboundOpenInfo = InboundId;
+    type OutboundProtocol = DirectGrpcUpgradeProtocol;
+    type OutboundOpenInfo = OutboundRequest;
 
-    fn listen_protocol(&self) -> SubstreamProtocol<ReadyUpgrade<String>, ()> {
-        SubstreamProtocol::new(ReadyUpgrade::new(self.protocol_name.clone()), ())
+    fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
+        SubstreamProtocol::new(
+            DirectGrpcUpgradeProtocol {
+                protocol_name: self.protocol_name.clone(),
+            },
+            self.inbound_id_gen.next(),
+        )
     }
 
-    fn on_behaviour_event(&mut self, _: Self::InEvent) {}
+    fn on_behaviour_event(&mut self, outbound_req: Self::InEvent) {
+        self.outbounds.push_back(outbound_req);
+    }
 
     fn connection_keep_alive(&self) -> KeepAlive {
         KeepAlive::Yes
@@ -79,7 +142,7 @@ impl ConnectionHandler for Handler {
 
     fn poll(
         &mut self,
-        cx: &mut Context<'_>,
+        _: &mut Context<'_>,
     ) -> Poll<
         ConnectionHandlerEvent<
             Self::OutboundProtocol,
@@ -88,33 +151,28 @@ impl ConnectionHandler for Handler {
             Self::Error,
         >,
     > {
-        if let Some(stream) = self.inbound_streams.pop_front() {
-            return Poll::Ready(ConnectionHandlerEvent::Custom(Event::InboundStream(stream)));
+        // Check for a pending (fatal) error.
+        if let Some(err) = self.pending_error.take() {
+            // The handler will not be polled again by the `Swarm`.
+            return Poll::Ready(ConnectionHandlerEvent::Close(err));
+        }
+        // Drain pending events.
+        if let Some(event) = self.pending_events.pop_front() {
+            return Poll::Ready(ConnectionHandlerEvent::Custom(event));
+        } else if self.pending_events.capacity() > crate::EMPTY_QUEUE_SHRINK_THRESHOLD {
+            self.pending_events.shrink_to_fit();
         }
 
-        match self.outbound.take() {
-            Some(OutboundState::MakeGrpcChannel(mut fut)) => match fut.poll_unpin(cx) {
-                Poll::Ready(result) => {
-                    self.outbound = Some(OutboundState::GrpcServing);
-                    return Poll::Ready(ConnectionHandlerEvent::Custom(
-                        Event::OutboundGrpcChannel(result),
-                    ));
-                }
-                Poll::Pending => {}
-            },
-            Some(OutboundState::OpenStream) => {
-                self.outbound = Some(OutboundState::OpenStream);
-            }
-            Some(OutboundState::GrpcServing) => {
-                self.outbound = Some(OutboundState::GrpcServing);
-            }
-            None => {
-                self.outbound = Some(OutboundState::OpenStream);
-                let protocol =
-                    SubstreamProtocol::new(ReadyUpgrade::new(self.protocol_name.clone()), ());
-                return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest { protocol });
-            }
+        if let Some(outbound_req) = self.outbounds.pop_front() {
+            let protocol = SubstreamProtocol::new(
+                DirectGrpcUpgradeProtocol {
+                    protocol_name: self.protocol_name.clone(),
+                },
+                outbound_req,
+            );
+            return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest { protocol });
         }
+        debug_assert!(self.outbounds.is_empty());
 
         Poll::Pending
     }
@@ -131,40 +189,29 @@ impl ConnectionHandler for Handler {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
                 protocol: stream,
-                ..
-            }) => {
-                if !self.inbound_streams.is_empty() {
-                    tracing::warn!(
-                        "New inbound gRPC request from {} while a previous one \
-                         is still pending. Queueing the new one.",
-                        self.remote_peer_id,
-                    );
-                }
-                self.inbound_streams.push_back(stream);
-            }
+                info,
+            }) => self.pending_events.push_back(Event::InboundStream {
+                inbound_id: info,
+                stream,
+            }),
+
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol: stream,
-                ..
-            }) => {
-                let stream_wrapper = adapter::NegotiatedStreamWrapper::new(
-                    stream,
-                    self.remote_peer_id.clone(),
-                    self.connection_id,
-                );
-                self.outbound = Some(OutboundState::MakeGrpcChannel(
-                    adapter::make_stream_to_tonic_channel(stream_wrapper).boxed(),
-                ));
-            }
+                info: outbound_request,
+            }) => self.pending_events.push_back(Event::OutboundStream {
+                outbound_request,
+                stream,
+            }),
+
             ConnectionEvent::DialUpgradeError(dial_upgrade_error) => {
                 self.on_dial_upgrade_error(dial_upgrade_error)
             }
-            ConnectionEvent::AddressChange(_) | ConnectionEvent::ListenUpgradeError(_) => {}
+
+            ConnectionEvent::ListenUpgradeError(listen_upgrade_error) => {
+                self.on_listen_upgrade_error(listen_upgrade_error)
+            }
+
+            ConnectionEvent::AddressChange(_) => {}
         }
     }
-}
-
-enum OutboundState {
-    OpenStream,
-    MakeGrpcChannel(adapter::GrpcChannelMakeFuture),
-    GrpcServing,
 }

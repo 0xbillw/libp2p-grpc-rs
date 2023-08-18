@@ -18,9 +18,8 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::mpsc,
 };
-use tonic::transport::{
-    server::Connected, Channel, Endpoint as TonicEndpoint, Error as TonicTransportError, Uri,
-};
+use tonic::transport::{server::Connected, Endpoint as TonicEndpoint, Uri};
+pub use tonic::transport::{Channel, Error as TonicTransportError};
 use tower::{BoxError, Service};
 
 #[pin_project]
@@ -176,19 +175,13 @@ impl Service<Uri> for OutboundStreamMaker {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum TonicChannelError {
-    #[error(transparent)]
-    FromTonic(#[from] TonicTransportError),
-    #[error("other error: {0}")]
-    Other(Box<dyn std::error::Error + Send + 'static>),
-}
+pub type OutboundGrpcChannelResult = Result<Channel, TonicTransportError>;
 
-pub type TonicChannelResult = Result<Channel, TonicChannelError>;
+pub type GrpcChannelMakeFuture = BoxFuture<'static, OutboundGrpcChannelResult>;
 
-pub type GrpcChannelMakeFuture = BoxFuture<'static, TonicChannelResult>;
-
-pub async fn make_stream_to_tonic_channel(stream: NegotiatedStreamWrapper) -> TonicChannelResult {
+pub async fn make_outbound_stream_to_grpc_channel(
+    stream: NegotiatedStreamWrapper,
+) -> OutboundGrpcChannelResult {
     let (tx, rx) = mpsc::channel(1);
     let mns = OutboundStreamMaker::new(rx);
     let fut = async move {
@@ -202,5 +195,5 @@ pub async fn make_stream_to_tonic_channel(stream: NegotiatedStreamWrapper) -> To
     if let Err(send_err) = send_result {
         tracing::error!("send stream to channel maker error: {:?}", send_err);
     }
-    ch_result.map_err(TonicChannelError::FromTonic)
+    ch_result
 }
