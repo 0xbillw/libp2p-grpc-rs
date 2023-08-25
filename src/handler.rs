@@ -1,4 +1,4 @@
-use crate::{protocol::DirectGrpcUpgradeProtocol, InboundId, InboundIdGen, OutboundRequest};
+use crate::{protocol::DirectGrpcUpgradeProtocol, InboundId, InboundIdGen, OutboundId};
 use libp2p::{
     core::upgrade::{NegotiationError, UpgradeError},
     swarm::{
@@ -25,13 +25,13 @@ pub enum Event {
     },
 
     OutboundStream {
-        outbound_request: OutboundRequest,
+        outbound_id: OutboundId,
         stream: NegotiatedSubstream,
     },
 
-    OutboundTimeout(OutboundRequest),
+    OutboundTimeout(OutboundId),
 
-    OutboundUnsupportedProtocols(OutboundRequest),
+    OutboundUnsupportedProtocols(OutboundId),
 
     InboundTimeout(InboundId),
 
@@ -40,7 +40,7 @@ pub enum Event {
 
 pub struct Handler {
     protocol_name: String,
-    outbounds: VecDeque<OutboundRequest>,
+    outbound: Option<OutboundId>,
     pending_error: Option<ConnectionHandlerUpgrErr<io::Error>>,
     pending_events: VecDeque<Event>,
     inbound_id_gen: InboundIdGen,
@@ -51,7 +51,7 @@ impl Handler {
         Handler {
             protocol_name,
             inbound_id_gen,
-            outbounds: VecDeque::new(),
+            outbound: None,
             pending_error: None,
             pending_events: VecDeque::new(),
         }
@@ -115,13 +115,13 @@ impl Handler {
 }
 
 impl ConnectionHandler for Handler {
-    type InEvent = OutboundRequest;
+    type InEvent = OutboundId;
     type OutEvent = Event;
     type Error = ConnectionHandlerUpgrErr<io::Error>;
     type InboundProtocol = DirectGrpcUpgradeProtocol;
     type InboundOpenInfo = InboundId;
     type OutboundProtocol = DirectGrpcUpgradeProtocol;
-    type OutboundOpenInfo = OutboundRequest;
+    type OutboundOpenInfo = OutboundId;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
         SubstreamProtocol::new(
@@ -132,8 +132,14 @@ impl ConnectionHandler for Handler {
         )
     }
 
-    fn on_behaviour_event(&mut self, outbound_req: Self::InEvent) {
-        self.outbounds.push_back(outbound_req);
+    fn on_behaviour_event(&mut self, outbound_id: Self::InEvent) {
+        if let Some(prev_outbound_id) = self.outbound.replace(outbound_id) {
+            tracing::warn!(
+                "The previous {:?} was not processed and will be replaced with a new {:?}",
+                prev_outbound_id,
+                outbound_id
+            );
+        }
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
@@ -163,16 +169,15 @@ impl ConnectionHandler for Handler {
             self.pending_events.shrink_to_fit();
         }
 
-        if let Some(outbound_req) = self.outbounds.pop_front() {
+        if let Some(outbound_id) = self.outbound.take() {
             let protocol = SubstreamProtocol::new(
                 DirectGrpcUpgradeProtocol {
                     protocol_name: self.protocol_name.clone(),
                 },
-                outbound_req,
+                outbound_id,
             );
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest { protocol });
         }
-        debug_assert!(self.outbounds.is_empty());
 
         Poll::Pending
     }
@@ -197,9 +202,9 @@ impl ConnectionHandler for Handler {
 
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol: stream,
-                info: outbound_request,
+                info: outbound_id,
             }) => self.pending_events.push_back(Event::OutboundStream {
-                outbound_request,
+                outbound_id,
                 stream,
             }),
 
