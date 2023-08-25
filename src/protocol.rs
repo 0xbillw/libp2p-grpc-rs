@@ -2,7 +2,6 @@ use crate::{adapter, OutboundError};
 use futures::{channel::oneshot, future};
 use libp2p::{
     core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo},
-    identity::PeerId,
     swarm::NegotiatedSubstream,
 };
 use std::{
@@ -32,7 +31,7 @@ impl Default for OutboundId {
 
 impl fmt::Display for OutboundId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "OutboundId({})", self.0)
     }
 }
 
@@ -59,7 +58,7 @@ impl Default for InboundId {
 
 impl fmt::Display for InboundId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "InboundId({})", self.0)
     }
 }
 
@@ -95,7 +94,6 @@ unsafe impl Send for InboundIdGen {}
 
 #[derive(Debug)]
 pub struct OutboundRequest {
-    pub(crate) peer: PeerId,
     pub(crate) outbound_id: OutboundId,
     pub(crate) sender: oneshot::Sender<Result<adapter::Channel, OutboundError>>,
 }
