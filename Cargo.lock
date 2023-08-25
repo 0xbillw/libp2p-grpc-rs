@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "libp2p-grpc-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "libp2p",
