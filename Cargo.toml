@@ -5,10 +5,10 @@ edition = "2021"
 rust-version = "1.65.0"
 description = "A library running gRPC on LibP2P for Rust"
 authors = ["Bill.W <0xbillw@gmail.com>"]
-license = "Apache License"
+license-file = "LICENSE"
 repository = "https://github.com/0xbillw/libp2p-grpc-rs"
 keywords = ["libp2p", "gRPC", "networking", "peer-to-peer"]
-categories = ["network-programming", "asynchronous", "gRPC"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 futures = "0.3"
